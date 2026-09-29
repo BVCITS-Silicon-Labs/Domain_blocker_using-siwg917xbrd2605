@@ -1,0 +1,116 @@
+# Silicon Labs Project Configuration Tools: slcp, v0, Component selection file.
+project_name: siwg917_ip_blocker
+label: siwg917_ip_blocker
+description: "Start a Wi-Fi client and transmits/receives data to measure WLAN UDP/TCP/TLS\
+  \ throughput performance on multiple threads using a remote iPerf client/server\
+  \ \n"
+category: Example|Wi-Fi
+filter:
+- name: Project Difficulty
+  value:
+  - Beginner
+- name: Wireless Technology
+  value:
+  - Wi-Fi
+package: wifi_app
+quality: production
+readme:
+- path: readme.md
+source:
+- path: app.c
+include:
+- path: .
+  file_list:
+  - path: app.h
+sdk:
+  vendor: silabs
+  id: simplicity_sdk
+  version: 2025.12.3
+toolchain_settings:
+- value: -u _printf_float
+  option: gcc_linker_option
+- value: -Wall -Werror
+  option: gcc_compiler_option
+component:
+- package: simplicity_sdk
+  vendor: silabs
+  id: freertos
+- package: simplicity_sdk
+  vendor: silabs
+  id: freertos_heap_4
+- package: simplicity_sdk
+  vendor: silabs
+  id: sl_main
+- package: wiseconnect3_sdk
+  vendor: silabs
+  id: SIWG917M111MGTBA
+- package: wiseconnect3_sdk
+  vendor: silabs
+  id: basic_network_config_manager
+- package: wiseconnect3_sdk
+  vendor: silabs
+  id: brd2605a
+- package: wiseconnect3_sdk
+  vendor: silabs
+  id: bsd_socket
+- package: wiseconnect3_sdk
+  vendor: silabs
+  id: network_manager
+- package: wiseconnect3_sdk
+  vendor: silabs
+  id: si91x_memory_default_config
+- package: wiseconnect3_sdk
+  vendor: silabs
+  id: sl_si91x_asynchronous_socket
+- package: wiseconnect3_sdk
+  vendor: silabs
+  id: sl_si91x_internal_stack
+- package: wiseconnect3_sdk
+  vendor: silabs
+  id: sl_si91x_mem_pool_buffers_with_quota
+- package: wiseconnect3_sdk
+  vendor: silabs
+  id: syscalls
+- package: wiseconnect3_sdk
+  vendor: silabs
+  id: wifi
+- package: wiseconnect3_sdk
+  vendor: silabs
+  id: wifi_resources
+- package: wiseconnect3_sdk
+  vendor: silabs
+  id: wiseconnect_common
+other_file:
+- path: resources/readme/UDP_TX.png
+- path: resources/readme/UDP_RX.png
+- path: resources/readme/TCP_TX.png
+- path: resources/readme/TCP_RX.png
+- path: resources/readme/TLS_TX.png
+- path: resources/readme/TLS_RX.png
+- path: resources/readme/UDP_TX_NCP.png
+- path: resources/readme/UDP_RX_NCP.png
+- path: resources/readme/TCP_TX_NCP.png
+- path: resources/readme/TCP_RX_NCP.png
+- path: resources/readme/TLS_TX_NCP.png
+- path: resources/readme/TLS_RX_NCP.png
+- path: resources/readme/setup_soc_ncp.png
+- path: resources/readme/output_soc.png
+define:
+- name: SL_SI91X_PRINT_DBG_LOG
+requires:
+- name: device_needs_ram_execution
+configuration:
+- name: SL_BOARD_ENABLE_VCOM
+  value: '1'
+ui_hints:
+  highlight:
+  - path: readme.md
+    focus: true
+sdk_extension:
+- vendor: silabs
+  id: wiseconnect3_sdk
+  version: 4.0.2
+post_build:
+- path: siwg917_ip_blocker.slpb
+  profile: wiseconnect_soc
+
