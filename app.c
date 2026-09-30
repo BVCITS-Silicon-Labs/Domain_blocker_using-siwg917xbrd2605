@@ -3,6 +3,9 @@
 #include "sl_net_default_values.h"
 #include "cmsis_os2.h"
 #include "socket.h"
+#include "sl_si91x_socket.h"
+#include "FreeRTOS.h"
+#include "task.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -10,6 +13,8 @@
 #include <stdlib.h>
 #include <ctype.h>
 #include <errno.h>
+
+#define APP_BUILD_TAG "DNS_TIMEOUT_FIX_V4_BSD"
 
 /* ============================================================
  * Configuration
@@ -21,7 +26,15 @@
 #define HTTP_PORT              80
 #define DNS_PORT               53
 #define DNS_PACKET_SIZE         1232
-#define DNS_UPSTREAM_TIMEOUT_SEC 2
+#define DNS_UPSTREAM_TIMEOUT_SEC 1
+#define DNS_TRANSACTION_COOLDOWN_MS 2000U
+
+#ifdef SL_SI91X_SO_RCVTIME
+#define DNS_RCVTIMEOUT_OPTION SL_SI91X_SO_RCVTIME
+#else
+#define DNS_RCVTIMEOUT_OPTION SO_RCVTIMEO
+#endif
+
 
 #define HTTP_REQUEST_SIZE      2048
 #define HTTP_PAGE_SIZE         8192
@@ -41,7 +54,8 @@ static char blocked_domains[MAX_BLOCKED_DOMAINS][MAX_DOMAIN_LENGTH];
 static uint32_t blocked_domain_count = 0;
 
 static char device_ip_string[32] = "0.0.0.0";
-static char dns_gateway_string[32] = "0.0.0.0";
+static const char dns_primary_server[] = "1.1.1.1";
+static const char dns_secondary_server[] = "8.8.8.8";
 
 /*
  * The SDK documentation names sl_si91x_time_value for SO_RCVTIMEO.
@@ -669,7 +683,7 @@ static int build_http_page(char *page,
 
         "<div>"
         "<input id='domain' "
-        "placeholder='Enter domain e.g. youtube.com'>"
+        "placeholder='Fixed test domain: example.com'>"
         "<button class='add' onclick='addDomain()'>"
         "Block Domain"
         "</button>"
@@ -913,6 +927,7 @@ static void handle_http_request(int client_socket,
         printf("[HTTP] Add domain request: %s\n",
                domain);
 
+
         if (app_add_blocked_domain(domain) == 0) {
 
             send_http_response(
@@ -977,6 +992,7 @@ static void handle_http_request(int client_socket,
 
         printf("[HTTP] Remove domain request: %s\n",
                domain);
+
 
         if (app_remove_blocked_domain(domain) == 0) {
 
@@ -1513,39 +1529,57 @@ static void dns_send_nxdomain(
  * sendto(), and the stack chooses the local source port.
  * ============================================================ */
 
+static void dns_print_memory(const char *where)
+{
+    UBaseType_t stack_free_words = uxTaskGetStackHighWaterMark(NULL);
+
+    printf(
+        "[MEM] %s: free_heap=%lu min_ever=%lu DNS_stack_free=%lu words\n",
+        where,
+        (unsigned long)xPortGetFreeHeapSize(),
+        (unsigned long)xPortGetMinimumEverFreeHeapSize(),
+        (unsigned long)stack_free_words
+    );
+}
+
+
 static int dns_set_upstream_timeout(int socket_fd)
 {
-    struct timeval timeout;
+    app_time_value_t timeout;
+    int result;
 
-    timeout.tv_sec =
-        DNS_UPSTREAM_TIMEOUT_SEC;
+    memset(&timeout, 0, sizeof(timeout));
+    timeout.tv_sec = DNS_UPSTREAM_TIMEOUT_SEC;
+    timeout.tv_usec = 0;
 
-    timeout.tv_usec =
-        0;
+    printf("[DNS] Setting receive timeout = %d second\n",
+           DNS_UPSTREAM_TIMEOUT_SEC);
+    printf("[DNS] timeout struct: size=%lu tv_sec=%lu tv_usec=%lu\n",
+           (unsigned long)sizeof(timeout),
+           (unsigned long)timeout.tv_sec,
+           (unsigned long)timeout.tv_usec);
 
-    if (setsockopt(
-            socket_fd,
-            SOL_SOCKET,
-            SO_RCVTIMEO,
-            &timeout,
-            sizeof(timeout)) < 0) {
+    result = setsockopt(socket_fd,
+                        SOL_SOCKET,
+                        DNS_RCVTIMEOUT_OPTION,
+                        &timeout,
+                        sizeof(timeout));
 
-        printf(
-            "[DNS] SO_RCVTIMEO failed, errno=%d\n",
-            errno
-        );
+#if defined(SL_SI91X_SO_RCVTIME)
+    printf("[DNS] timeout API: SL_SI91X_SO_RCVTIME option=%d result=%d errno=%d\n",
+           DNS_RCVTIMEOUT_OPTION, result, errno);
+#else
+    printf("[DNS] timeout API: BSD SO_RCVTIMEO option=%d result=%d errno=%d\n",
+           DNS_RCVTIMEOUT_OPTION, result, errno);
+#endif
 
+    if (result < 0) {
+        printf("[DNS] ERROR: receive timeout configuration failed\n");
         return -1;
     }
 
-    printf(
-        "[DNS] Upstream RX timeout = %d seconds\n",
-        DNS_UPSTREAM_TIMEOUT_SEC
-    );
-
     return 0;
 }
-
 
 static void dns_make_upstream_address(
     struct sockaddr_in *address,
@@ -1565,7 +1599,7 @@ static void dns_make_upstream_address(
      * the destination port directly for IPv4 socket addresses.
      */
     address->sin_port =
-        DNS_PORT;
+        htons(DNS_PORT);
 
     sl_net_inet_addr(
         ip_string,
@@ -1608,75 +1642,7 @@ static int dns_response_matches_query(
 }
 
 
-static int dns_send_all(
-    int socket_fd,
-    const uint8_t *data,
-    int length)
-{
-    int sent_total = 0;
-
-    while (sent_total < length) {
-        int32_t sent =
-            send(
-                socket_fd,
-                data + sent_total,
-                (size_t)(length - sent_total),
-                0
-            );
-
-        if (sent <= 0) {
-            printf(
-                "[DNS] TCP send failed, errno=%d\n",
-                errno
-            );
-
-            return -1;
-        }
-
-        sent_total +=
-            (int)sent;
-    }
-
-    return sent_total;
-}
-
-
-static int dns_recv_all(
-    int socket_fd,
-    uint8_t *data,
-    int length)
-{
-    int received_total = 0;
-
-    while (received_total < length) {
-        int32_t received =
-            recv(
-                socket_fd,
-                data + received_total,
-                (size_t)(length - received_total),
-                0
-            );
-
-        if (received <= 0) {
-            printf(
-                "[DNS] TCP recv failed/timeout, errno=%d\n",
-                errno
-            );
-
-            return -1;
-        }
-
-        received_total +=
-            (int)received;
-    }
-
-    return received_total;
-}
-
-
-/* ============================================================
- * DNS over UDP
- * ============================================================ */
+/* TCP send/receive helpers intentionally omitted: UDP-only DNS forwarding. */
 
 static int dns_forward_udp(
     const uint8_t *query,
@@ -1686,18 +1652,16 @@ static int dns_forward_udp(
     int response_size)
 {
     int32_t upstream_socket;
+
     struct sockaddr_in upstream_address;
+    struct sockaddr_in response_address;
+    struct sockaddr_in local_address;
+
+    socklen_t response_address_length;
+
     int32_t sent;
     int32_t received;
-    int32_t connect_result;
 
-    /*
-     * IMPORTANT:
-     * On SiWx91x BSD sockets, receive-side UDP operation is most
-     * reliable when the UDP socket is associated with a peer.
-     * connect() implicitly assigns the local endpoint, then send()/recv()
-     * are used for this one DNS transaction.
-     */
     upstream_socket =
         socket(
             AF_INET,
@@ -1710,11 +1674,51 @@ static int dns_forward_udp(
         (long)upstream_socket
     );
 
+    dns_print_memory("after upstream socket()");
+
     if (upstream_socket < 0) {
+
         printf(
             "[DNS] UDP upstream socket failed, errno=%d\n",
             errno
         );
+
+        return -1;
+    }
+
+    /*
+     * Give the upstream UDP socket an explicit local source port.
+     * This avoids relying on an unbound UDP socket for the reply path.
+     * The socket is closed after one DNS transaction, so a fixed test
+     * port is sufficient here.
+     */
+    memset(&local_address, 0, sizeof(local_address));
+    local_address.sin_family = AF_INET;
+    local_address.sin_port = htons(40053);
+    local_address.sin_addr.s_addr = 0;
+
+    printf("[DNS] Binding upstream UDP local port 40053...\n");
+
+    if (bind(
+            upstream_socket,
+            (struct sockaddr *)&local_address,
+            sizeof(local_address)) < 0) {
+
+        printf(
+            "[DNS] Upstream UDP bind failed, errno=%d\n",
+            errno
+        );
+
+        close(upstream_socket);
+        return -1;
+    }
+
+    printf("[DNS] Upstream UDP local bind successful\n");
+
+    if (dns_set_upstream_timeout(
+            upstream_socket) < 0) {
+
+        close(upstream_socket);
         return -1;
     }
 
@@ -1728,120 +1732,113 @@ static int dns_forward_udp(
         server_ip
     );
 
-    /* Associate this UDP socket with the DNS server. */
-    connect_result =
-        connect(
+    printf("[DNS] UDP source port: 40053\n");
+    dns_print_memory("before upstream sendto()");
+
+    sent =
+        sendto(
             upstream_socket,
-            (struct sockaddr *)&upstream_address,
+            query,
+            query_length,
+            0,
+            (const struct sockaddr *)&upstream_address,
             sizeof(upstream_address)
         );
 
     printf(
-        "[DNS] UDP connect(%s:53) returned: %ld, errno=%d\n",
-        server_ip,
-        (long)connect_result,
-        errno
-    );
-
-    if (connect_result < 0) {
-        close(upstream_socket);
-        return -1;
-    }
-
-    /* Set receive timeout after the socket has been connected. */
-    if (dns_set_upstream_timeout(upstream_socket) < 0) {
-        close(upstream_socket);
-        return -1;
-    }
-
-    /* Show the local UDP port selected by the stack. */
-    {
-        struct sockaddr_in local_address;
-        socklen_t local_address_length = sizeof(local_address);
-
-        memset(
-            &local_address,
-            0,
-            sizeof(local_address)
-        );
-
-        if (getsockname(
-                upstream_socket,
-                (struct sockaddr *)&local_address,
-                &local_address_length) == 0) {
-
-            printf(
-                "[DNS] UDP local port selected by stack: %u\n",
-                (unsigned int)ntohs(local_address.sin_port)
-            );
-        }
-        else {
-            printf(
-                "[DNS] getsockname() failed, errno=%d\n",
-                errno
-            );
-        }
-    }
-
-    /* Send the original DNS query unchanged. */
-    sent =
-        send(
-            upstream_socket,
-            query,
-            query_length,
-            0
-        );
-
-    printf(
-        "[DNS] UDP send returned: %ld, errno=%d\n",
-        (long)sent,
-        errno
+        "[DNS] UDP sendto returned: %ld\n",
+        (long)sent
     );
 
     if (sent != query_length) {
+
         printf(
             "[DNS] UDP send failed, errno=%d\n",
             errno
         );
+
         close(upstream_socket);
         return -1;
     }
+
+    response_address_length =
+        sizeof(response_address);
+
+    memset(
+        &response_address,
+        0,
+        sizeof(response_address)
+    );
 
     printf(
         "[DNS] Waiting for UDP upstream response...\n"
     );
 
+    dns_print_memory("before upstream recvfrom()");
+
+    printf(
+        "[DNS] BEFORE recvfrom(): socket=%ld timeout=%d sec\n",
+        (long)upstream_socket,
+        DNS_UPSTREAM_TIMEOUT_SEC
+    );
+
+    uint32_t recv_start_tick = osKernelGetTickCount();
+
     received =
-        recv(
+        recvfrom(
             upstream_socket,
             response,
             response_size,
-            0
+            0,
+            (struct sockaddr *)&response_address,
+            &response_address_length
         );
 
+    uint32_t recv_end_tick = osKernelGetTickCount();
+    uint32_t recv_elapsed_ticks = recv_end_tick - recv_start_tick;
+    uint32_t tick_frequency = osKernelGetTickFreq();
+    uint32_t recv_elapsed_ms = 0;
+
+    if (tick_frequency != 0U) {
+        recv_elapsed_ms =
+            (recv_elapsed_ticks * 1000U) / tick_frequency;
+    }
+
     printf(
-        "[DNS] UDP recv returned: %ld, errno=%d\n",
+        "[DNS] AFTER recvfrom(): returned=%ld errno=%d elapsed=%lu ms\n",
         (long)received,
-        errno
+        errno,
+        (unsigned long)recv_elapsed_ms
     );
 
+    dns_print_memory("after upstream recvfrom()");
+
     if (received < 0) {
+
         printf(
             "[DNS] UDP upstream timeout/error, errno=%d\n",
             errno
         );
+
         close(upstream_socket);
         return -1;
     }
 
     if (received < 12) {
+
         printf(
             "[DNS] UDP upstream response too short\n"
         );
+
         close(upstream_socket);
         return -1;
     }
 
+    /*
+     * Accept only a DNS response matching this query.
+     * The fresh socket is used for one transaction, so there
+     * is no other expected application traffic on it.
+     */
     if (!dns_response_matches_query(
             query,
             query_length,
@@ -1862,8 +1859,10 @@ static int dns_forward_udp(
     );
 
     close(upstream_socket);
+
     return (int)received;
 }
+
 
 /* ============================================================
  * DNS over TCP
@@ -1872,201 +1871,7 @@ static int dns_forward_udp(
  * before the DNS message.
  * ============================================================ */
 
-static int dns_forward_tcp(
-    const uint8_t *query,
-    int query_length,
-    const char *server_ip,
-    uint8_t *response,
-    int response_size)
-{
-    int32_t tcp_socket;
-
-    struct sockaddr_in server_address;
-
-    uint8_t length_prefix[2];
-
-    int32_t connect_result;
-
-    if (query_length > 65535) {
-        return -1;
-    }
-
-    tcp_socket =
-        socket(
-            AF_INET,
-            SOCK_STREAM,
-            IPPROTO_TCP
-        );
-
-    printf(
-        "[DNS] TCP upstream socket() returned: %ld\n",
-        (long)tcp_socket
-    );
-
-    if (tcp_socket < 0) {
-
-        printf(
-            "[DNS] TCP socket creation failed, errno=%d\n",
-            errno
-        );
-
-        return -1;
-    }
-
-    if (dns_set_upstream_timeout(
-            tcp_socket) < 0) {
-
-        close(tcp_socket);
-        return -1;
-    }
-
-    memset(
-        &server_address,
-        0,
-        sizeof(server_address)
-    );
-
-    server_address.sin_family =
-        AF_INET;
-
-    /*
-     * Silicon Labs WiSeConnect BSD socket examples use the
-     * remote TCP port directly.
-     */
-    server_address.sin_port =
-        DNS_PORT;
-
-    sl_net_inet_addr(
-        server_ip,
-        &server_address.sin_addr.s_addr
-    );
-
-    printf(
-        "[DNS] TCP destination: %s:53\n",
-        server_ip
-    );
-
-    connect_result =
-        connect(
-            tcp_socket,
-            (struct sockaddr *)&server_address,
-            sizeof(server_address)
-        );
-
-    printf(
-        "[DNS] TCP connect returned: %ld\n",
-        (long)connect_result
-    );
-
-    if (connect_result < 0) {
-
-        printf(
-            "[DNS] TCP connect failed, errno=%d\n",
-            errno
-        );
-
-        close(tcp_socket);
-        return -1;
-    }
-
-    /*
-     * Two-byte DNS-over-TCP length prefix.
-     * Build the bytes explicitly so this is independent of the
-     * SiWx91x socket address byte-order convention.
-     */
-    length_prefix[0] =
-        (uint8_t)((query_length >> 8) & 0xFF);
-
-    length_prefix[1] =
-        (uint8_t)(query_length & 0xFF);
-
-    if (dns_send_all(
-            tcp_socket,
-            length_prefix,
-            2) < 0) {
-
-        close(tcp_socket);
-        return -1;
-    }
-
-    if (dns_send_all(
-            tcp_socket,
-            query,
-            query_length) < 0) {
-
-        close(tcp_socket);
-        return -1;
-    }
-
-    /*
-     * Receive the two-byte DNS-over-TCP response length.
-     */
-    if (dns_recv_all(
-            tcp_socket,
-            length_prefix,
-            2) < 0) {
-
-        close(tcp_socket);
-        return -1;
-    }
-
-    int response_length =
-        ((int)length_prefix[0] << 8) |
-        (int)length_prefix[1];
-
-    printf(
-        "[DNS] TCP response length: %d\n",
-        response_length
-    );
-
-    if (response_length < 12 ||
-        response_length > response_size) {
-
-        printf(
-            "[DNS] TCP response length invalid\n"
-        );
-
-        close(tcp_socket);
-        return -1;
-    }
-
-    if (dns_recv_all(
-            tcp_socket,
-            response,
-            response_length) < 0) {
-
-        close(tcp_socket);
-        return -1;
-    }
-
-    if (!dns_response_matches_query(
-            query,
-            query_length,
-            response,
-            response_length)) {
-
-        printf(
-            "[DNS] TCP upstream response did not match query\n"
-        );
-
-        close(tcp_socket);
-        return -1;
-    }
-
-    printf(
-        "[DNS] TCP upstream response accepted: %d bytes\n",
-        response_length
-    );
-
-    close(tcp_socket);
-
-    return response_length;
-}
-
-
-/* ============================================================
- * DNS server thread
- * ============================================================ */
+/* DNS-over-TCP fallback intentionally omitted. */
 
 static void dns_server_thread(void *argument)
 {
@@ -2086,13 +1891,8 @@ static void dns_server_thread(void *argument)
 
     osDelay(500);
 
-    printf(
-        "\n[DNS] Thread started\n"
-    );
-
-    printf(
-        "[DNS] Creating UDP socket...\n"
-    );
+    printf("\n[DNS] Thread started\n");
+    printf("[DNS] Creating UDP socket...\n");
 
     dns_socket =
         socket(
@@ -2101,40 +1901,20 @@ static void dns_server_thread(void *argument)
             IPPROTO_UDP
         );
 
-    printf(
-        "[DNS] socket() returned: %ld\n",
-        (long)dns_socket
-    );
+    printf("[DNS] socket() returned: %ld\n",
+           (long)dns_socket);
 
     if (dns_socket < 0) {
-
-        printf(
-            "[DNS] ERROR: socket creation failed, errno=%d\n",
-            errno
-        );
-
+        printf("[DNS] ERROR: socket creation failed, errno=%d\n", errno);
         return;
     }
 
-    memset(
-        &server_address,
-        0,
-        sizeof(server_address)
-    );
+    memset(&server_address, 0, sizeof(server_address));
+    server_address.sin_family = AF_INET;
+    server_address.sin_port = htons(DNS_PORT);
+    server_address.sin_addr.s_addr = 0;
 
-    server_address.sin_family =
-        AF_INET;
-
-    server_address.sin_port =
-        htons(DNS_PORT);
-
-    server_address.sin_addr.s_addr =
-        0;
-
-    printf(
-        "[DNS] Calling bind() on UDP port %d...\n",
-        DNS_PORT
-    );
+    printf("[DNS] Binding UDP port %d...\n", DNS_PORT);
 
     int32_t bind_status =
         bind(
@@ -2143,53 +1923,27 @@ static void dns_server_thread(void *argument)
             sizeof(server_address)
         );
 
-    printf(
-        "[DNS] bind() returned: %ld\n",
-        (long)bind_status
-    );
+    printf("[DNS] bind() returned: %ld\n",
+           (long)bind_status);
 
     if (bind_status < 0) {
-
-        printf(
-            "[DNS] ERROR: bind port 53 failed, errno=%d\n",
-            errno
-        );
-
+        printf("[DNS] ERROR: bind port 53 failed, errno=%d\n", errno);
         close(dns_socket);
         return;
     }
 
-    printf(
-        "[DNS] UDP port 53 listening\n"
-    );
+    printf("[DNS] UDP port 53 listening\n");
+    dns_print_memory("DNS thread ready");
 
     while (1) {
-        memset(
-            &client_address,
-            0,
-            sizeof(client_address)
-        );
+        memset(&client_address, 0, sizeof(client_address));
+        memset(packet, 0, sizeof(packet));
+        memset(response, 0, sizeof(response));
+        memset(domain, 0, sizeof(domain));
 
-        memset(
-            packet,
-            0,
-            sizeof(packet)
-        );
+        client_address_length = sizeof(client_address);
 
-        memset(
-            response,
-            0,
-            sizeof(response)
-        );
-
-        memset(
-            domain,
-            0,
-            sizeof(domain)
-        );
-
-        client_address_length =
-            sizeof(client_address);
+        printf("[DNS] Waiting for DNS query...\n");
 
         int32_t received =
             recvfrom(
@@ -2202,58 +1956,34 @@ static void dns_server_thread(void *argument)
             );
 
         if (received < 0) {
-
-            printf(
-                "[DNS] Client recvfrom failed, errno=%d\n",
-                errno
-            );
-
+            printf("[DNS] Client recvfrom failed, errno=%d\n", errno);
             osDelay(50);
             continue;
         }
 
         if (received < 12) {
-
-            printf(
-                "[DNS] Ignoring short DNS packet: %ld bytes\n",
-                (long)received
-            );
-
+            printf("[DNS] Ignoring short DNS packet: %ld bytes\n",
+                   (long)received);
             continue;
         }
 
-        printf(
-            "[DNS] Received DNS packet: %ld bytes\n",
-            (long)received
-        );
+        printf("[DNS] recvfrom returned: %ld\n", (long)received);
+        dns_print_memory("after client DNS recvfrom()");
 
         if (dns_extract_domain(
                 packet,
                 received,
                 domain,
                 sizeof(domain)) != 0) {
-
-            printf(
-                "[DNS] Could not parse query\n"
-            );
-
+            printf("[DNS] Could not parse query\n");
             continue;
         }
 
-        printf(
-            "[DNS] Query: %s\n",
-            domain
-        );
+        printf("[DNS] Query domain: %s\n", domain);
 
-        /*
-         * Blocked domain -> NXDOMAIN.
-         */
+        /* BLOCKED -> NXDOMAIN -> cooldown -> next query */
         if (domain_is_blocked(domain)) {
-
-            printf(
-                "[DNS] BLOCKED: %s\n",
-                domain
-            );
+            printf("[DNS] BLOCKED: %s\n", domain);
 
             dns_send_nxdomain(
                 dns_socket,
@@ -2263,124 +1993,45 @@ static void dns_server_thread(void *argument)
                 client_address_length
             );
 
+            printf("[DNS] Transaction complete - cooldown %lu ms\n",
+                   (unsigned long)DNS_TRANSACTION_COOLDOWN_MS);
+            osDelay(DNS_TRANSACTION_COOLDOWN_MS);
+            printf("[DNS] Cooldown complete - ready for next DNS query\n");
             continue;
         }
 
         /*
-         * Allowed domain -> upstream DNS.
+         * ALLOWED -> 1.1.1.1 -> 8.8.8.8 -> SERVFAIL.
+         * Each upstream recvfrom() gets a strict 1-second timeout.
          */
-        printf(
-            "[DNS] ALLOWED: %s\n",
-            domain
-        );
+        printf("[DNS] ALLOWED: %s\n", domain);
+        dns_print_memory("before upstream DNS transaction");
 
         int response_length =
-            -1;
-
-        /*
-         * ====================================================
-         * 1. UDP to gateway
-         * ====================================================
-         */
-        if (strcmp(
-                dns_gateway_string,
-                "0.0.0.0") != 0) {
-
-            printf(
-                "[DNS] UDP primary: %s:53\n",
-                dns_gateway_string
+            dns_forward_udp(
+                packet,
+                received,
+                dns_primary_server,
+                response,
+                sizeof(response)
             );
+
+        if (response_length < 0) {
+            printf("[DNS] Primary timeout/failure -> trying %s:53\n",
+                   dns_secondary_server);
 
             response_length =
                 dns_forward_udp(
                     packet,
                     received,
-                    dns_gateway_string,
+                    dns_secondary_server,
                     response,
                     sizeof(response)
                 );
         }
 
-        /*
-         * ====================================================
-         * 2. UDP fallback
-         * ====================================================
-         */
-        if (response_length <= 0) {
-
-            printf(
-                "[DNS] UDP primary failed; trying 1.1.1.1\n"
-            );
-
-            response_length =
-                dns_forward_udp(
-                    packet,
-                    received,
-                    "1.1.1.1",
-                    response,
-                    sizeof(response)
-                );
-        }
-
-        /*
-         * ====================================================
-         * 3. TCP gateway fallback
-         *
-         * This is the important additional recovery path.
-         * If UDP packets leave the SiWG917 but responses do not
-         * return through the UDP socket, DNS over TCP can still
-         * obtain the answer from a server that supports TCP/53.
-         * ====================================================
-         */
-        if (response_length <= 0 &&
-            strcmp(
-                dns_gateway_string,
-                "0.0.0.0") != 0) {
-
-            printf(
-                "[DNS] UDP failed; trying TCP primary: %s:53\n",
-                dns_gateway_string
-            );
-
-            response_length =
-                dns_forward_tcp(
-                    packet,
-                    received,
-                    dns_gateway_string,
-                    response,
-                    sizeof(response)
-                );
-        }
-
-        /*
-         * ====================================================
-         * 4. TCP fallback
-         * ====================================================
-         */
-        if (response_length <= 0) {
-
-            printf(
-                "[DNS] TCP primary failed; trying TCP 1.1.1.1:53\n"
-            );
-
-            response_length =
-                dns_forward_tcp(
-                    packet,
-                    received,
-                    "1.1.1.1",
-                    response,
-                    sizeof(response)
-                );
-        }
-
-        /*
-         * ====================================================
-         * Return answer to original client
-         * ====================================================
-         */
         if (response_length > 0) {
-
-            int32_t client_sent =
+            int32_t sent_to_client =
                 sendto(
                     dns_socket,
                     response,
@@ -2390,75 +2041,50 @@ static void dns_server_thread(void *argument)
                     client_address_length
                 );
 
-            printf(
-                "[DNS] Client sendto returned: %ld\n",
-                (long)client_sent
-            );
+            printf("[DNS] Response sent to client: %ld\n",
+                   (long)sent_to_client);
 
-            if (client_sent ==
-                response_length) {
-
-                printf(
-                    "[DNS] Response forwarded successfully\n"
-                );
-            }
-            else {
-
-                printf(
-                    "[DNS] Client DNS response send failed, errno=%d\n",
-                    errno
-                );
+            if (sent_to_client != response_length) {
+                printf("[DNS] Client response send failed, errno=%d\n",
+                       errno);
             }
         }
         else {
+            /* Both upstream servers failed -> SERVFAIL. */
+            memcpy(response, packet, (size_t)received);
 
-            /*
-             * Both UDP and TCP upstream paths failed.
-             * Give the Windows resolver a definite SERVFAIL.
-             */
-            uint8_t servfail[
-                DNS_PACKET_SIZE
-            ];
+            /* QR=1, preserve RD, RCODE=2 (SERVFAIL). */
+            response[2] =
+                (uint8_t)(0x80U | (packet[2] & 0x01U));
+            response[3] = 0x02;
 
-            memcpy(
-                servfail,
-                packet,
-                (size_t)received
-            );
+            response[6] = 0x00;
+            response[7] = 0x00;
+            response[8] = 0x00;
+            response[9] = 0x00;
+            response[10] = 0x00;
+            response[11] = 0x00;
 
-            servfail[2] =
-                (uint8_t)(
-                    0x80U |
-                    (packet[2] & 0x01U)
-                );
-
-            servfail[3] =
-                0x02;
-
-            servfail[6] = 0x00;
-            servfail[7] = 0x00;
-
-            servfail[8] = 0x00;
-            servfail[9] = 0x00;
-
-            servfail[10] = 0x00;
-            servfail[11] = 0x00;
-
-            int32_t client_sent =
+            int32_t sent_to_client =
                 sendto(
                     dns_socket,
-                    servfail,
+                    response,
                     received,
                     0,
                     (const struct sockaddr *)&client_address,
                     client_address_length
                 );
 
-            printf(
-                "[DNS] SERVFAIL sendto returned: %ld\n",
-                (long)client_sent
-            );
+            printf("[DNS] Both upstream DNS servers failed\n");
+            printf("[DNS] SERVFAIL sent: %ld\n",
+                   (long)sent_to_client);
         }
+
+        /* Every complete transaction gets exactly one cooldown. */
+        printf("[DNS] Transaction complete - cooldown %lu ms\n",
+               (unsigned long)DNS_TRANSACTION_COOLDOWN_MS);
+        osDelay(DNS_TRANSACTION_COOLDOWN_MS);
+        printf("[DNS] Cooldown complete - ready for next DNS query\n");
     }
 }
 
@@ -2483,6 +2109,7 @@ void app_init(void)
 
     printf("\n");
     printf("========================================\n");
+    printf("[APP] Build: %s\n", APP_BUILD_TAG);
     printf(" SiWG917 IP / DOMAIN BLOCKER\n");
     printf("========================================\n");
 
@@ -2585,39 +2212,16 @@ void app_init(void)
             (unsigned long)((ip >> 24) & 0xFF)
         );
 
-        /*
-         * Use the DHCP gateway address as the primary upstream
-         * DNS server. In the user's network this is 192.168.2.1,
-         * and the PC has already verified that 192.168.2.1:53
-         * answers DNS queries.
-         */
-        const uint8_t *gw =
-            profile.ip.ip.v4.gateway.bytes;
-
-        snprintf(
-            dns_gateway_string,
-            sizeof(dns_gateway_string),
-            "%u.%u.%u.%u",
-            gw[0],
-            gw[1],
-            gw[2],
-            gw[3]
-        );
-
         printf("[APP] Device IP: %s\n",
                device_ip_string);
 
-        printf("[APP] DNS upstream gateway: %s\n",
-               dns_gateway_string);
+        printf("[APP] DNS upstream: %s:53 -> %s:53\n",
+               dns_primary_server,
+               dns_secondary_server);
     }
     else {
         strcpy(
             device_ip_string,
-            "0.0.0.0"
-        );
-
-        strcpy(
-            dns_gateway_string,
             "0.0.0.0"
         );
 
@@ -2672,8 +2276,9 @@ void app_init(void)
            device_ip_string);
     printf("DNS  : %s:53\n",
            device_ip_string);
-    printf("DNS upstream: %s (gateway), fallback 1.1.1.1\n",
-           dns_gateway_string);
+    printf("DNS upstream : %s:53 -> %s:53\n",
+           dns_primary_server,
+           dns_secondary_server);
     printf("========================================\n");
 }
 
