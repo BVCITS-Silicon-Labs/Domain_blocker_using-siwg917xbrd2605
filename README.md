@@ -1,95 +1,83 @@
-# Domain Blocker using Silicon Labs SiWx917 (SiWG917X-BRD2605)
-
-[![Hardware](https://img.shields.io/badge/Hardware-SiWG917X--BRD2605-005596.svg)](https://www.silabs.com/)
-[![SDK](https://img.shields.io/badge/Gecko%20SDK%20%2F%20WiseConnect-v3.x-green.svg)](https://github.com/SiliconLabs)
-[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-
-An embedded, hardware-level domain filtering and network blocking application implemented on the **Silicon Labs SiWx917 Wi-Fi & Bluetooth Wireless Co-Processor / SoC Radio Board (BRD2605A)**.
-
-This project monitors network traffic and prevents connected devices or local applications from resolving and establishing connections to specified blacklisted domains.
-
----
-
 # SiWG917 Embedded IP & Domain Blocker (BRD2605A)
 
-An embedded network-level domain filtering firewall and DNS sinkhole built for the **Silicon Labs SiWG917** Wi-Fi SoC running on the **BRD2605A** radio board.
+An embedded hardware-level domain filtering firewall and DNS sinkhole running on the Silicon Labs SiWG917 SoC Radio Board (BRD2605A).
+
+The firmware intercepts inbound DNS queries on UDP port 53, evaluates requested hostnames against an in-memory blocklist using thread-safe CMSIS-RTOS2 primitives, and responds with an RFC 1035 NXDOMAIN (RCODE 3) packet for blocked hosts. Allowed queries are proxied to upstream recursive resolvers (1.1.1.1 and 8.8.8.8) with socket timeouts. The device simultaneously runs an embedded HTTP server on TCP port 80 that provides a web-based dashboard and REST-like endpoints to add, remove, and list blocked domains in real time.
 
 ---
 
-## 🚀 Key Features
-
-- **Concurrent Dual-Service Architecture (FreeRTOS):**
-  - **DNS Server (`UDP/53`):** Intercepts client DNS lookups, inspects query names (QNAME), blocks configured domains with `NXDOMAIN` (RFC 1035), and forwards legitimate traffic to upstream recursive resolvers (`1.1.1.1` and `8.8.8.8`).
-  - **Embedded Web Management Portal (`TCP/80`):** Responsive dashboard providing real-time blocked domain viewing, dynamic rule addition (`/api/add`), and rule removal (`/api/remove`).
-- **Resilient Upstream Forwarding:** Employs socket-level timeout enforcement (`SL_SI91X_SO_RCVTIME` / `SO_RCVTIMEO`) and automatic fallback to secondary resolvers or `SERVFAIL` (RCODE 2).
-- **Concurrency & Memory Safety:** Uses CMSIS-RTOS2 mutexes (`domain_mutex`) to synchronize blocklist access across the HTTP and DNS threads, maintaining safe high-water mark margins on FreeRTOS Heap 4.
-
----
-
-## 🛠️ Hardware & SDK Requirements
-
-- **Development Hardware:** Silicon Labs BRD2605A (SiWG917M111MGTBA)
-- **Simplicity SDK:** `2025.12.3`
-- **WiSeConnect 3 SDK:** `4.0.2`
-- **RTOS:** FreeRTOS (Heap 4) with CMSIS-RTOS2 abstraction layer
-
----
-
-## 📂 Project Structure
-
-## 📌 Overview
-
-Traditional network filters rely on heavy desktop software or dedicated router appliances. This project demonstrates an ultra-low-power, MCU-based domain filtering firewall leveraging the dual-core architecture and high-performance Wi-Fi stack of the SiWx917.
-
-### Key Features
-- **Network-Level Interception**: Inspects outgoing network transactions (DNS / Hostname requests) at the device layer.
-- **Configurable Blacklist**: Blocks user-defined domains (e.g., ad networks, tracking endpoints, restricted domains).
-- **Ultra-Low Power Operations**: Optimized for battery-operated or standalone low-power network accessories.
-- **Serial Debugging Output**: Real-time inspection logs via USART/UART VCOM interface.
+## Table of Contents
+- [Key Features](#-key-features)
+- [System Architecture](#-system-architecture)
+- [Hardware & Software Prerequisites](#-hardware--software-prerequisites)
+- [Repository Structure](#-repository-structure)
+- [Source Code Deep-Dive](#-source-code-deep-dive)
+  - [Memory Allocation & Thread Budgets](#memory-allocation--thread-budgets)
+  - [Domain Normalization & Boundary Matching](#domain-normalization--boundary-matching)
+  - [DNS Packet Parsing & RFC 1035 NXDOMAIN Construction](#dns-packet-parsing--rfc-1035-nxdomain-construction)
+  - [Upstream Forwarding & Failover State Machine](#upstream-forwarding--failover-state-machine)
+  - [Embedded Web Server & REST API](#embedded-web-server--rest-api)
+- [Setup & Build Instructions](#-setup--build-instructions)
+- [UART Console Logs](#-uart-console-logs)
+- [Client-Side Verification](#-client-side-verification)
+- [License](#-license)
 
 ---
 
-## 🛠️ Hardware & Software Requirements
-
-### Hardware
-* **Board**: Silicon Labs **SiWG917X-BRD2605A** (SiWx917 Wi-Fi + Bluetooth Radio Board)
-* **Mainboard**: Wireless Starter Kit Mainboard (BRD4001A / BRD4002A) or direct USB-C On-Board J-Link Connection
-* **Micro-USB / USB-C Cable**
-
-### Software
-* **IDE**: [Simplicity Studio v5](https://www.silabs.com/developers/simplicity-studio)
-* **SDK**: Silicon Labs WiseConnect 3 SDK / Gecko SDK (GSDK)
-* **Toolchain**: GNU ARM Embedded Toolchain (`arm-none-eabi-gcc`)
-* **Serial Terminal**: PuTTY, Tera Term, or Serial Monitor (115200 Baud Rate)
-
-
-## 📂 Project Structure
-
-├── app.c                     # Core application logic (HTTP server & DNS sinkhole threads)
-├── app.h                     # Public API prototypes and shared declarations
-├── main.c                    # Firmware bootstrap and task scheduler dispatch
-├── siwg917_ip_blocker.slcp   # Simplicity Studio project configuration
-├── siwg917_ip_blocker.slpb   # Post-build pipeline descriptor (.rps, .hex, .bin)
-└── siwg917_ip_blocker.slps   # Toolchain and board descriptor
+## 📌 Key Features
+- **Dual-Thread FreeRTOS Architecture**: Separates high-frequency UDP packet processing from client HTTP requests into two dedicated tasks (DNS stack: 6144 B; HTTP stack: 8192 B).
+- **RFC 1035 Standards-Compliant DNS Sinkhole**: Intercepts queries on UDP port 53, extracts domain labels, matches them with dot-boundary checks, and crafts authoritative NXDOMAIN responses (Header Flags: 0x8403).
+- **Dual Upstream Recursive Forwarding**: Forwards permitted domain queries to Cloudflare (1.1.1.1) and fails over to Google (8.8.8.8), with socket receive timeouts (`SL_SI91X_SO_RCVTIME` / `SO_RCVTIMEO`) and fallback to SERVFAIL (RCODE 2).
+- **Zero-Dependency Web Portal**: Embedded HTTP/1.0 micro-server provides an in-browser management UI and JSON endpoints (`/api/add`, `/api/remove`, `/api/domains`).
+- **Thread-Safe Shared State**: Protects concurrent access to the blocklist across the HTTP and DNS threads via CMSIS-RTOS2 mutex primitives (`osMutexAcquire`/`osMutexRelease`).
+- **Low-Level Memory Monitoring**: High-water mark checks via `uxTaskGetStackHighWaterMark()` and heap monitoring via `xPortGetFreeHeapSize()` maintain stack margins on FreeRTOS Heap 4.
 
 ---
 
-## ⚙️ How It Works
+## ⚙️ System Architecture
 
-1. **Station Connection:** Connects as a Wi-Fi client interface and acquires an IP via DHCP.
-2. **DNS Sinkholing:** 
-   - Receives standard UDP queries on port 53.
-   - Extracts and normalizes QNAME labels.
-   - If the query matches the blocklist, immediately crafts and transmits an RFC 1035 `NXDOMAIN` response (`0x8403`).
-   - If allowed, forwards the query to Cloudflare (`1.1.1.1`) or Google (`8.8.8.8`) over UDP source port `40053`.
-3. **Web Interface:** Direct a browser to `http://<Device_IP>` to add or remove domains on the fly.
+```text
+                               +-------------------------------------------------------------+
+                               |                 Silicon Labs SiWG917 (BRD2605A)             |
+                               |                                                             |
+   +-----------------------+   |   +-----------------------------------------------------+   |
+   |   Client Machine      |   |   |                   FreeRTOS Kernel                   |   |
+   |   (PC / Smartphone)   |   |   +-----------------------------------------------------+   |
+   +-----------------------+   |                              |                              |
+      |                 |      |          +-------------------+-------------------+          |
+      | UDP/53 (DNS)    |      |          |                                       |          |
+      |                 |      |          v                                       v          |
+      |                 |      |   +--------------------------+       +----------------------+   |
+      |                 +--------->|  DNS Server Task (UDP:53)|       | HTTP Server (TCP:80) |   |
+      |                        |   |  - Label parser (QNAME)  |       | - Dashboard (/)      |   |
+      |                        |   |  - Check blocklist mutex |       | - /api/add           |   |
+      |                        |   +--------------------------+       | - /api/remove        |   |
+      |                        |          |           |               | - /api/domains       |   |
+      |                        |   Match  |           | No Match      +----------------------+   |
+      |                        |          v           v                          ^           |
+      |<--- NXDOMAIN (0x8403) -+----------+       +-------------------+          |           |
+      |                                           | Forward to 1.1.1.1|          |           |
+      |                                           | Failover: 8.8.8.8 |          |           |
+      |                                           +-------------------+          |           |
+      |                                                     |                    |           |
+      | HTTP/80 (Browser Management)                        | Upstream Reply     |           |
+      +-----------------------------------------------------+--------------------+-----------+|
 
 ---
 
-## 🧪 Client Validation (Windows PowerShell)
+##🛠️ Hardware & Software Prerequisites
+'''Hardware
+Radio Board: Silicon Labs SiWx917 Wi-Fi SoC Radio Board (BRD2605A / SiWG917M111MGTBA).
 
-Set your DNS server to the SiWG917 board's IP address:
-```powershell
-Resolve-DnsName -Name youtube.com -Server 192.168.137.45 -DnsOnly
-Resolve-DnsName -Name x.com -Server 192.168.137.45 -DnsOnly
+Mainboard / Carrier: Direct USB-C connection to onboard Segger J-Link debugger and Virtual COM port.
 
+Host Network: 2.4 GHz 802.11 b/g/n Wi-Fi Access Point with DHCP enabled.
+
+'''Software & SDK
+IDE: Simplicity Studio v5 or VS Code with Silicon Labs Simplicity extension.
+
+SDK Suite: Simplicity SDK 2025.12.3 with WiSeConnect 3 SDK extension 4.0.2.
+
+Toolchain: GNU Arm Embedded Toolchain (arm-none-eabi-gcc) with -u _printf_float -Wall -Werror.
+
+Serial Terminal: 115200 Baud, 8 Data Bits, 1 Stop Bit, No Parity (8-N-1).
