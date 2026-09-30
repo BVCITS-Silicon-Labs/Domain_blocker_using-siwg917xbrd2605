@@ -35,19 +35,4 @@ Traditional network filters rely on heavy desktop software or dedicated router a
 * **Toolchain**: GNU ARM Embedded Toolchain (`arm-none-eabi-gcc`)
 * **Serial Terminal**: PuTTY, Tera Term, or Serial Monitor (115200 Baud Rate)
 
----
 
-## 📁 Repository Structure
-
-```text
-├── SimplicityStudio/       # IDE Project files and configuration
-├── src/
-│   ├── main.c              # Main application logic & state machine
-│   ├── domain_blocker.c    # Domain matching engine & packet inspection
-│   ├── wifi_app.c          # Wi-Fi station/AP management routines
-│   └── config/             # System and Wi-Fi network configurations
-├── inc/
-│   ├── domain_blocker.h    # Domain list structure and header definitions
-│   └── wifi_app.h          # Wi-Fi handler headers
-├── README.md               # Project documentation
-└── LICENSE                 # Project License
